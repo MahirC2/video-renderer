@@ -12,6 +12,7 @@ MP4 with animated visuals and Mistral TTS (Voxtral) voiceover.
    (audio-driven timeline). Explicit `duration` overrides when you want a
    scene to linger.
 3. MoviePy composites the scenes with animations and encodes the final MP4.
+   Narration subtitles and an editable PowerPoint deck are emitted alongside it.
 
 ## Running locally
 
@@ -19,19 +20,21 @@ MP4 with animated visuals and Mistral TTS (Voxtral) voiceover.
 git clone https://github.com/iamjonjackson/video-renderer.git
 cd video-renderer
 python3 -m venv .venv && source .venv/bin/activate
-pip install moviepy matplotlib imageio-ffmpeg pillow
+pip install -r requirements.txt
 
 cp .env.example .env     # then edit .env and add your MISTRAL_API_KEY
 set -a; source .env; set +a   # load env vars (or use dotenv in your shell)
 
-# Final videos go to ./output, intermediate render files to ./temp
+# Final videos, subtitle files, and PowerPoint decks go to ./output.
+# Large render writes happen in the system temp folder before final copy.
 python3 src/render.py samples/sample-spec.json -o output/demo.mp4
 ```
 
 Notes:
 - `.env` is gitignored; `.env.example` documents the variables.
-- `output/` (final videos) and `temp/` (TTS/image caches, intermediate
-  artifacts) are gitignored except their `.gitkeep` placeholders.
+- `output/` (rendered deliverables) is gitignored except its `.gitkeep`
+  placeholder. Render caches and intermediate files use the system temp folder
+  by default; pass `--workdir` to choose another cache location.
 - Without `MISTRAL_API_KEY`, scenes render silently and AI image blocks are
   skipped with a warning — the pipeline never hard-fails on missing AI.
 - System ffmpeg is used if installed; otherwise `imageio-ffmpeg` bundles one.
@@ -63,9 +66,26 @@ using the `MISTRAL_API_KEY` repo secret and uploads the MP4 as an artifact.
 - **Animations**: `fade`, `slide-up`, `zoom-in`, `kenburns` (images)
 - **PPTX export**: every render also emits a `.pptx` alongside the MP4 —
   one slide per scene, built from the same artifacts (narration WAVs
-  embedded on their slides, chart PNGs, generated images). Open in
+  embedded on their slides, narration text in speaker notes, editable native
+  charts, and generated images). Open in
   PowerPoint, tweak, and export to video from there for a near-identical
   result.
+- **Subtitles**: narrated scenes produce a matching `.srt` file. Long scripts
+  are split into readable cues; per-bullet narration follows its audio timing.
+- **Branding**: add an optional top-level `branding` block to overlay a
+  transparent PNG watermark in a frame corner. `scenes` can be `"all"` or a
+  list of scene types.
+
+```json
+"branding": {
+  "logo": "assets/logo.png",
+  "position": "bottom-right",
+  "margin": 48,
+  "opacity": 0.85,
+  "max_height": 0.1,
+  "scenes": ["title", "outro"]
+}
+```
 - **AI-generated images** (optional, any scene): add an `image` block —
 
 ```json
@@ -92,11 +112,24 @@ by construction) with the image in a bordered panel.
 
 See `samples/sample-spec.json` for a complete example.
 
+### Validating a spec
+
+Every render checks `src/schema.json` first and reports all errors with their
+scene numbers before starting. To validate without rendering:
+
+```bash
+python3 src/render.py samples/sample-spec.json --validate
+# or
+python3 src/validate.py samples/sample-spec.json
+```
+
 ## Files
 
 - `src/render.py` — spec → MP4 renderer (MoviePy + Matplotlib)
 - `src/tts.py` — Mistral Voxtral TTS REST client (`/v1/audio/speech`)
 - `src/schema.json` — JSON Schema for the spec
+- `src/validate.py` — spec validation with scene-numbered errors
+- `requirements.txt` — Python runtime dependencies
 - `src/themes/presets.py` — dark/light color presets
 - `demos/` — rendered example videos from `samples/sample-spec.json`
 

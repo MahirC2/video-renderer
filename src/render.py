@@ -9,13 +9,16 @@ length + padding), unless an explicit `duration` overrides them.
 import argparse
 import hashlib
 import json
+import shutil
 import subprocess
 import sys
+import tempfile
 from pathlib import Path
 
 import matplotlib
 matplotlib.use("Agg")
 import matplotlib.pyplot as plt
+import numpy as np
 from moviepy import (ColorClip, CompositeVideoClip, ImageClip, TextClip,
                      VideoFileClip, AudioFileClip, CompositeAudioClip, concatenate_videoclips,
                      concatenate_audioclips, vfx)
@@ -25,6 +28,7 @@ sys.path.insert(0, str(Path(__file__).parent / "themes"))
 import images as imggen
 import tts
 import presets
+from validate import SpecError, load_and_validate, report
 
 ANIM_IN = 0.6
 SLIDE_DIST = 120
@@ -54,7 +58,7 @@ def _resolve_font(bold: bool = False) -> str:
 
 
 def load_spec(path: str) -> dict:
-    spec = json.loads(Path(path).read_text())
+    spec = load_and_validate(path)
     theme = dict(presets.__dict__[spec.get("theme", {}).get("preset", "dark")])
     theme.update({k: v for k, v in spec.get("theme", {}).items() if k != "preset"})
     spec["theme"] = theme
@@ -64,8 +68,8 @@ def load_spec(path: str) -> dict:
     return spec
 
 
-def synth_narration(scene: dict, workdir: Path, voice_cfg: dict) -> tuple[str | None, float]:
-    """Synthesize narration if present; return (audio_path, duration)."""
+def synth_narration(scene: dict, workdir: Path, voice_cfg: dict):
+    """Return (combined audio path, total duration, (text, duration) segments)."""
     texts = []
     per_bullet = scene.get("narration_per_bullet")
     if per_bullet:
@@ -73,7 +77,7 @@ def synth_narration(scene: dict, workdir: Path, voice_cfg: dict) -> tuple[str | 
     elif scene.get("narration"):
         texts = [scene["narration"]]
     if not texts:
-        return None, 0.0
+        return None, 0.0, []
     paths = []
     for i, text in enumerate(texts):
         h = hashlib.sha1(text.encode()).hexdigest()[:10]
@@ -86,13 +90,15 @@ def synth_narration(scene: dict, workdir: Path, voice_cfg: dict) -> tuple[str | 
                 fmt=voice_cfg.get("format", "wav"),
             )
         paths.append(str(out))
+    segments = [(text, tts.audio_duration(path)) for text, path in zip(texts, paths)]
+    total_duration = sum(duration for _, duration in segments)
     if len(paths) == 1:
-        return paths[0], tts.audio_duration(paths[0])
+        return paths[0], total_duration, segments
     combined = workdir / f"narr_combined_{hashlib.sha1(json.dumps(paths).encode()).hexdigest()[:10]}.{voice_cfg.get('format', 'wav')}"
     if not combined.exists():
         merged = concatenate_audioclips([AudioFileClip(p) for p in paths])
         merged.write_audiofile(str(combined), logger=None)
-    return str(combined), tts.audio_duration(str(combined))
+    return str(combined), total_duration, segments
 
 
 def scene_duration(scene: dict, audio_dur: float, default: float = 4.0) -> float:
@@ -251,7 +257,7 @@ def _wrap_to_width(text: str, size: int, font: str, max_w_px: int,
     return "\n".join(lines[:max_lines])
 
 
-def build_bullets(scene, theme, workdir=None):
+def build_bullets(scene, theme, workdir=None, reveal_offsets=None, duration=None):
     bg = ColorClip(size=(W, H), color=rgb(theme["bg"]))
     clips = [bg]
     text_x_frac = 0.5
@@ -277,11 +283,23 @@ def build_bullets(scene, theme, workdir=None):
     b_size = int(theme["font_size"] * 0.55)
     top, bottom = 0.30, 0.85
     step = (bottom - top) / max(n, 1)
+    reveal_offsets = reveal_offsets or [i * scene.get("stagger", 0.4)
+                                        for i in range(n)]
     for i, item in enumerate(scene["items"]):
         bullet = _left_text_clip("• " + item, theme, b_size,
                                  max_w_px=int(W * max_w))
         y = int(H * (top + i * step))
-        clips.append(bullet.with_position((x, y)))
+        offset = reveal_offsets[i] if i < len(reveal_offsets) else i * scene.get("stagger", 0.4)
+        remaining = max(0.0, (duration or 0.0) - offset)
+        if duration is not None and remaining <= 0:
+            continue
+        bullet = bullet.with_position((x, y)).with_start(offset)
+        if duration is not None:
+            bullet = bullet.with_duration(remaining)
+        else:
+            bullet = bullet.with_duration(60)
+        bullet = bullet.with_effects([vfx.FadeIn(min(0.25, remaining or 0.25))])
+        clips.append(bullet)
     return CompositeVideoClip(clips, size=(W, H))
 
 
@@ -380,6 +398,105 @@ def _ffmpeg_exe() -> str:
     return imageio_ffmpeg.get_ffmpeg_exe()
 
 
+def apply_branding(clip, branding, scene_type, duration):
+    """Overlay an optional transparent logo without changing scene geometry."""
+    if not branding:
+        return clip
+    scenes = branding.get("scenes", "all")
+    if scenes != "all" and scene_type not in scenes:
+        return clip
+    logo_path = Path(branding["logo"])
+    if not logo_path.is_file():
+        return clip
+
+    from PIL import Image
+    image = Image.open(logo_path).convert("RGBA")
+    max_height = max(1, int(H * branding.get("max_height", 0.10)))
+    max_width = int(W * 0.22)
+    image.thumbnail((max_width, max_height), Image.Resampling.LANCZOS)
+    logo = ImageClip(np.asarray(image), transparent=True)
+    opacity = branding.get("opacity", 0.85)
+    if opacity < 1:
+        logo = logo.with_opacity(opacity)
+    margin = int(branding.get("margin", 48))
+    position = branding.get("position", "bottom-right")
+    x = margin if position.endswith("left") else W - margin - logo.w
+    y = margin if position.startswith("top") else H - margin - logo.h
+    logo = logo.with_position((x, y)).with_duration(duration)
+    return CompositeVideoClip([clip, logo], size=(W, H)).with_duration(duration)
+
+
+def _format_srt_time(seconds: float) -> str:
+    milliseconds = max(0, int(round(seconds * 1000)))
+    hours, milliseconds = divmod(milliseconds, 3_600_000)
+    minutes, milliseconds = divmod(milliseconds, 60_000)
+    whole_seconds, milliseconds = divmod(milliseconds, 1000)
+    return f"{hours:02d}:{minutes:02d}:{whole_seconds:02d},{milliseconds:03d}"
+
+
+def _subtitle_chunks(text: str, duration: float, max_chars: int = 42) -> list[str]:
+    words = []
+    for word in text.split():
+        words.extend(word[i:i + max_chars] for i in range(0, len(word), max_chars))
+    if not words:
+        return []
+    target_count = max(1, int(np.ceil(duration / 6.8)), int(np.ceil(len(text) / max_chars)))
+    target_count = min(target_count, len(words))
+    chunks, current = [], []
+    remaining_groups = target_count
+    for index, word in enumerate(words):
+        candidate = " ".join(current + [word])
+        left_words = len(words) - index
+        should_break = bool(current) and (
+            len(candidate) > max_chars or
+            (remaining_groups > 1 and len(current) >= max(1, int(np.ceil(left_words / remaining_groups))))
+        )
+        if should_break:
+            chunks.append(" ".join(current))
+            remaining_groups -= 1
+            current = [word]
+        else:
+            current.append(word)
+    if current:
+        chunks.append(" ".join(current))
+    return chunks
+
+
+def _write_srt(segments, path: Path):
+    """Write narration cues to an SRT beside the rendered video."""
+    cues = []
+    for start, text, duration in segments:
+        chunks = _subtitle_chunks(text, duration)
+        weights = [max(1, len(chunk)) for chunk in chunks]
+        total_weight = sum(weights)
+        cursor = start
+        allocated = 0.0
+        for index, (chunk, weight) in enumerate(zip(chunks, weights)):
+            cue_duration = duration * weight / total_weight
+            # Allocate the last cue the remainder to avoid rounding drift.
+            if index == len(chunks) - 1:
+                cue_duration = duration - allocated
+            end = cursor + cue_duration
+            cues.append((cursor, end, chunk))
+            cursor = end
+            allocated += cue_duration
+    contents = []
+    for number, (start, end, text) in enumerate(cues, 1):
+        contents.append(f"{number}\n{_format_srt_time(start)} --> {_format_srt_time(end)}\n{text}")
+    path.write_text("\n\n".join(contents) + ("\n" if contents else ""), encoding="utf-8")
+
+
+def _publish_render(staged_video: str, destination: Path):
+    """Copy completed artifacts to the requested location after local rendering."""
+    destination.parent.mkdir(parents=True, exist_ok=True)
+    staged = Path(staged_video)
+    shutil.copy2(staged, destination)
+    for suffix in (".pptx", ".srt"):
+        sidecar = staged.with_suffix(suffix)
+        if sidecar.is_file():
+            shutil.copy2(sidecar, destination.with_suffix(suffix))
+
+
 def _export_pptx(spec, scene_artifacts, output):
     try:
         import pptx_export
@@ -394,7 +511,14 @@ def render(spec_path: str, output: str, workdir: str | None = None):
     spec = load_spec(spec_path)
     theme = spec["theme"]
     voice_cfg = spec.get("voice", {})
-    workdir = Path(workdir or Path(spec_path).parent / ".render_cache")
+    destination = Path(output).expanduser().resolve()
+    destination.parent.mkdir(parents=True, exist_ok=True)
+    staging = tempfile.TemporaryDirectory(prefix="video-renderer-")
+    output = str(Path(staging.name) / destination.name)
+    if workdir is None:
+        spec_key = hashlib.sha1(str(Path(spec_path).resolve()).encode()).hexdigest()[:12]
+        workdir = Path(tempfile.gettempdir()) / f"video-renderer-cache-{spec_key}"
+    workdir = Path(workdir)
     workdir.mkdir(parents=True, exist_ok=True)
 
     video_clips, audios = [], []
@@ -402,28 +526,53 @@ def render(spec_path: str, output: str, workdir: str | None = None):
     t_cursor = 0.0
     fps = spec["meta"]["fps"]
     stream = len(spec["timeline"]) > 12
-    seg_dir = workdir / "segments"
+    seg_dir = Path(staging.name) / "segments"
+    subtitle_segments = []
+    branding = spec.get("branding")
+    if branding:
+        logo = Path(branding["logo"])
+        if not logo.is_absolute():
+            logo = Path(spec_path).resolve().parent / logo
+        branding = dict(branding, logo=str(logo))
+        if not logo.is_file():
+            print(f"[warn] branding logo not found at {logo}; continuing without watermark")
+            branding = None
     if stream:
         seg_dir.mkdir(exist_ok=True)
         print(f"[stream] long timeline ({len(spec['timeline'])} scenes); rendering per-scene segments")
     for i, scene in enumerate(spec["timeline"]):
         stype = scene["type"]
-        builder = BUILDERS[stype]
-        if stype in ("image", "chart", "title", "bullets"):
-            clip = builder(scene, theme, workdir)
-        else:
-            clip = builder(scene, theme)
-
         try:
-            audio_path, audio_dur = synth_narration(scene, workdir, voice_cfg)
+            audio_path, audio_dur, speech_segments = synth_narration(
+                scene, workdir, voice_cfg)
         except RuntimeError as e:
             if "MISTRAL_API_KEY" in str(e):
                 print(f"[warn] {e} — rendering scene {i} without narration")
                 audio_path, audio_dur = None, 0.0
+                speech_segments = [(text, 0.0) for text in
+                                   (scene.get("narration_per_bullet") or
+                                    ([scene["narration"]] if scene.get("narration") else []))]
             else:
                 raise
 
         dur = scene_duration(scene, audio_dur)
+        builder = BUILDERS[stype]
+        if stype == "bullets":
+            if scene.get("narration_per_bullet") and audio_path:
+                reveal_offsets = []
+                elapsed = 0.0
+                for _, segment_duration in speech_segments:
+                    reveal_offsets.append(elapsed)
+                    elapsed += segment_duration
+            else:
+                reveal_offsets = [n * scene.get("stagger", 0.4)
+                                  for n in range(len(scene["items"]))]
+            clip = builder(scene, theme, workdir, reveal_offsets, dur)
+        elif stype in ("image", "chart", "title"):
+            clip = builder(scene, theme, workdir)
+        else:
+            clip = builder(scene, theme)
+
         clip = clip.with_duration(dur)
         clip = apply_anim(clip, scene.get("anim", "fade"), dur)
         # Animations like zoom-in resize frames over time even though the
@@ -433,6 +582,8 @@ def render(spec_path: str, output: str, workdir: str | None = None):
         if scene.get("anim") in ("zoom-in", "kenburns"):
             clip = CompositeVideoClip([clip.with_position("center")], size=(W, H))\
                 .with_duration(dur)
+
+        clip = apply_branding(clip, branding, stype, dur)
 
         if audio_path:
             audios.append(AudioFileClip(audio_path).with_start(t_cursor))
@@ -461,7 +612,19 @@ def render(spec_path: str, output: str, workdir: str | None = None):
                 scrim, _ = imggen.scrim_for_contrast(
                     img_path, theme["fg"], theme["bg"], img_opacity=scene["image"].get("opacity", 0.25))
                 art["scrim"] = scrim
+        if stype == "image":
+            art["image_png"] = scene["src"]
         scene_artifacts.append(art)
+
+        if speech_segments:
+            elapsed = 0.0
+            for text, segment_duration in speech_segments:
+                if segment_duration <= 0:
+                    segment_duration = max(0.8, len(text.split()) / 2.5)
+                cue_duration = min(segment_duration, max(0.0, dur - elapsed))
+                if cue_duration > 0:
+                    subtitle_segments.append((t_cursor + elapsed, text, cue_duration))
+                elapsed += segment_duration
 
         print(f"[scene {i}] {stype}: {dur:.2f}s starting at {t_cursor:.2f}s"
               + (f" (narration {audio_dur:.2f}s)" if audio_path else ""))
@@ -489,8 +652,12 @@ def render(spec_path: str, output: str, workdir: str | None = None):
                            "-map", "0:v", "-map", "1:a",
                            "-shortest", tmp], check=True)
             Path(tmp).replace(output)
-        print(f"[done] {output} ({t_cursor:.1f}s at {fps}fps, streamed)")
         _export_pptx(spec, scene_artifacts, output)
+        if subtitle_segments:
+            _write_srt(subtitle_segments, Path(output).with_suffix(".srt"))
+        _publish_render(output, destination)
+        staging.cleanup()
+        print(f"[done] {destination} ({t_cursor:.1f}s at {fps}fps, streamed)")
         return
 
     final = concatenate_videoclips(video_clips, method="compose")
@@ -498,9 +665,12 @@ def render(spec_path: str, output: str, workdir: str | None = None):
         final = final.with_audio(CompositeAudioClip(audios))
     final.write_videofile(output, fps=fps, codec="libx264",
                           audio_codec="aac", logger=None)
-    print(f"[done] {output} ({t_cursor:.1f}s at {fps}fps)")
-
     _export_pptx(spec, scene_artifacts, output)
+    if subtitle_segments:
+        _write_srt(subtitle_segments, Path(output).with_suffix(".srt"))
+    _publish_render(output, destination)
+    staging.cleanup()
+    print(f"[done] {destination} ({t_cursor:.1f}s at {fps}fps)")
 
 
 if __name__ == "__main__":
@@ -508,6 +678,16 @@ if __name__ == "__main__":
     p.add_argument("spec")
     p.add_argument("-o", "--output", default="output/video.mp4")
     p.add_argument("--workdir", default=None)
+    p.add_argument("--validate", action="store_true",
+                   help="only validate the spec; do not render")
     args = p.parse_args()
+    try:
+        spec = load_spec(args.spec)
+    except SpecError as e:
+        print(report(args.spec, e), file=sys.stderr)
+        sys.exit(1)
+    if args.validate:
+        print(f"[spec] {args.spec}: OK ({len(spec['timeline'])} scenes)")
+        sys.exit(0)
     Path(args.output).parent.mkdir(parents=True, exist_ok=True)
     render(args.spec, args.output, args.workdir)

@@ -17,8 +17,7 @@ jobs:
           python-version: "3.12"
 
       - name: Install Python deps
-        run: |
-          pip install moviepy matplotlib imageio-ffmpeg pillow python-pptx
+        run: pip install -r requirements.txt
 
       - name: Render ${{ matrix.spec }}
         env:

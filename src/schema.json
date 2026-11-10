@@ -3,133 +3,177 @@
   "title": "Video Spec",
   "type": "object",
   "required": ["timeline"],
+  "additionalProperties": false,
   "properties": {
     "meta": {
       "type": "object",
+      "additionalProperties": false,
       "properties": {
         "title": { "type": "string" },
         "resolution": {
           "type": "object",
+          "additionalProperties": false,
           "properties": {
-            "width": { "type": "integer", "default": 1920 },
-            "height": { "type": "integer", "default": 1080 }
+            "width": { "type": "integer", "minimum": 1, "default": 1920 },
+            "height": { "type": "integer", "minimum": 1, "default": 1080 }
           }
         },
-        "fps": { "type": "integer", "default": 30 }
+        "fps": { "type": "integer", "minimum": 1, "maximum": 120, "default": 30 }
       }
     },
     "theme": {
       "type": "object",
+      "additionalProperties": false,
       "properties": {
         "preset": { "type": "string", "enum": ["dark", "light"], "default": "dark" },
-        "bg": { "type": "string", "description": "Background color, hex like #0d1117" },
-        "fg": { "type": "string", "description": "Foreground/text color, hex" },
-        "accent": { "type": "string", "description": "Accent color, hex" },
-        "font_size": { "type": "integer", "default": 64 },
-        "title_font_size": { "type": "integer", "default": 96 }
+        "bg": { "type": "string", "pattern": "^#[0-9a-fA-F]{6}$" },
+        "fg": { "type": "string", "pattern": "^#[0-9a-fA-F]{6}$" },
+        "accent": { "type": "string", "pattern": "^#[0-9a-fA-F]{6}$" },
+        "font_size": { "type": "integer", "minimum": 1, "default": 64 },
+        "title_font_size": { "type": "integer", "minimum": 1, "default": 96 }
       }
     },
     "voice": {
       "type": "object",
+      "additionalProperties": false,
       "properties": {
-        "slug": { "type": "string", "description": "Mistral TTS voice slug, e.g. en_jane_neutral" },
-        "voice_id": { "type": "string", "description": "Mistral TTS cloned voice UUID (overrides slug)" },
+        "slug": { "type": "string" },
+        "voice_id": { "type": "string" },
         "model": { "type": "string", "default": "voxtral-mini-tts-2603" },
         "format": { "type": "string", "enum": ["mp3", "wav"], "default": "mp3" }
       }
     },
+    "branding": { "$ref": "#/definitions/branding" },
     "timeline": {
       "type": "array",
+      "minItems": 1,
       "items": { "$ref": "#/definitions/scene" }
     }
   },
   "definitions": {
-    "scene": {
+    "sceneImage": {
       "type": "object",
+      "required": ["prompt"],
+      "additionalProperties": false,
+      "properties": {
+        "prompt": { "type": "string", "minLength": 1 },
+        "placement": { "type": "string", "enum": ["background", "left", "right"], "default": "background" },
+        "opacity": { "type": "number", "minimum": 0, "maximum": 1, "default": 0.25 },
+        "model": { "type": "string" },
+        "style": { "type": "string" }
+      }
+    },
+    "branding": {
+      "type": "object",
+      "required": ["logo"],
+      "additionalProperties": false,
+      "properties": {
+        "logo": { "type": "string", "minLength": 1 },
+        "position": { "type": "string", "enum": ["top-left", "top-right", "bottom-left", "bottom-right"], "default": "bottom-right" },
+        "margin": { "type": "integer", "minimum": 0, "default": 48, "description": "Pixel margin from the frame edge" },
+        "opacity": { "type": "number", "minimum": 0, "maximum": 1, "default": 0.85 },
+        "max_height": { "type": "number", "exclusiveMinimum": 0, "maximum": 0.5, "default": 0.1, "description": "Maximum logo height as a fraction of video height" },
+        "scenes": {
+          "oneOf": [
+            { "type": "string", "const": "all" },
+            { "type": "array", "uniqueItems": true, "items": { "type": "string", "enum": ["title", "bullets", "chart", "image", "outro"] } }
+          ],
+          "default": "all"
+        }
+      }
+    },
+    "scene": {
       "oneOf": [
         { "$ref": "#/definitions/title" },
         { "$ref": "#/definitions/bullets" },
         { "$ref": "#/definitions/image" },
         { "$ref": "#/definitions/chart" },
         { "$ref": "#/definitions/outro" }
-      ],
-      "properties": {
-        "transition": {
-          "type": "string",
-          "enum": ["none", "fade", "slide-left", "wipe"],
-          "description": "Transition into the next scene"
-        }
-      }
+      ]
     },
     "title": {
+      "type": "object",
+      "required": ["type", "text"],
+      "additionalProperties": false,
       "properties": {
         "type": { "const": "title" },
         "text": { "type": "string" },
         "subtitle": { "type": "string" },
-        "anim": { "enum": ["fade", "slide-up", "zoom-in"], "default": "fade" },
-        "duration": { "type": "number", "description": "Explicit duration in seconds; omit for audio-driven" },
-        "narration": { "type": "string", "description": "TTS text; scene auto-sizes to audio length + padding" },
-        "padding": { "type": "number", "default": 1.0, "description": "Extra seconds after narration ends (minimum tail buffer)" }
-      },
-      "required": ["type", "text"],
-      "additionalProperties": false
+        "anim": { "type": "string", "enum": ["fade", "slide-up", "zoom-in", "kenburns"], "default": "fade" },
+        "duration": { "type": "number", "exclusiveMinimum": 0 },
+        "narration": { "type": "string" },
+        "padding": { "type": "number", "minimum": 0, "default": 1.0 },
+        "image": { "$ref": "#/definitions/sceneImage" },
+        "transition": { "type": "string", "enum": ["none", "fade", "slide-left", "wipe"] }
+      }
     },
     "bullets": {
+      "type": "object",
+      "required": ["type", "items"],
+      "additionalProperties": false,
       "properties": {
         "type": { "const": "bullets" },
         "heading": { "type": "string" },
-        "items": { "type": "array", "items": { "type": "string" }, "minItems": 1 },
-        "stagger": { "type": "number", "default": 0.4, "description": "Seconds between bullet reveals" },
+        "items": { "type": "array", "minItems": 1, "items": { "type": "string" } },
+        "stagger": { "type": "number", "minimum": 0, "default": 0.4 },
+        "anim": { "type": "string", "enum": ["fade", "slide-up", "zoom-in", "kenburns"], "default": "fade" },
         "narration": { "type": "string" },
-        "narration_per_bullet": { "type": "array", "items": { "type": "string" }, "description": "One TTS clip per bullet, each bullet reveals as its audio starts" },
-        "duration": { "type": "number" },
-        "padding": { "type": "number", "default": 1.0 },
-        "transition": { "type": "string" }
-      },
-      "required": ["type", "items"],
-      "additionalProperties": false
+        "narration_per_bullet": { "type": "array", "items": { "type": "string" } },
+        "duration": { "type": "number", "exclusiveMinimum": 0 },
+        "padding": { "type": "number", "minimum": 0, "default": 1.0 },
+        "image": { "$ref": "#/definitions/sceneImage" },
+        "transition": { "type": "string", "enum": ["none", "fade", "slide-left", "wipe"] }
+      }
     },
     "image": {
+      "type": "object",
+      "required": ["type", "src"],
+      "additionalProperties": false,
       "properties": {
         "type": { "const": "image" },
-        "src": { "type": "string", "description": "Local path or URL to image" },
+        "src": { "type": "string", "minLength": 1 },
         "caption": { "type": "string" },
-        "anim": { "enum": ["fade", "kenburns"], "default": "fade" },
+        "anim": { "type": "string", "enum": ["fade", "kenburns"], "default": "fade" },
         "narration": { "type": "string" },
-        "duration": { "type": "number" },
-        "padding": { "type": "number", "default": 1.0 },
-        "transition": { "type": "string" }
-      },
-      "required": ["type", "src"],
-      "additionalProperties": false
+        "duration": { "type": "number", "exclusiveMinimum": 0 },
+        "padding": { "type": "number", "minimum": 0, "default": 1.0 },
+        "image": { "$ref": "#/definitions/sceneImage" },
+        "transition": { "type": "string", "enum": ["none", "fade", "slide-left", "wipe"] }
+      }
     },
     "chart": {
+      "type": "object",
+      "required": ["type", "labels", "values"],
+      "additionalProperties": false,
       "properties": {
         "type": { "const": "chart" },
-        "chart_type": { "enum": ["bar", "line", "pie"], "default": "bar" },
+        "chart_type": { "type": "string", "enum": ["bar", "line", "pie"], "default": "bar" },
         "heading": { "type": "string" },
-        "labels": { "type": "array", "items": { "type": "string" } },
-        "values": { "type": "array", "items": { "type": "number" } },
+        "labels": { "type": "array", "minItems": 1, "items": { "type": "string" } },
+        "values": { "type": "array", "minItems": 1, "items": { "type": "number" } },
         "y_label": { "type": "string" },
+        "anim": { "type": "string", "enum": ["fade", "slide-up", "zoom-in", "kenburns"], "default": "fade" },
         "narration": { "type": "string" },
-        "duration": { "type": "number" },
-        "padding": { "type": "number", "default": 1.0 },
-        "transition": { "type": "string" }
-      },
-      "required": ["type", "labels", "values"],
-      "additionalProperties": false
+        "duration": { "type": "number", "exclusiveMinimum": 0 },
+        "padding": { "type": "number", "minimum": 0, "default": 1.0 },
+        "image": { "$ref": "#/definitions/sceneImage" },
+        "transition": { "type": "string", "enum": ["none", "fade", "slide-left", "wipe"] }
+      }
     },
     "outro": {
+      "type": "object",
+      "required": ["type", "text"],
+      "additionalProperties": false,
       "properties": {
         "type": { "const": "outro" },
         "text": { "type": "string" },
+        "anim": { "type": "string", "enum": ["fade", "slide-up", "zoom-in", "kenburns"], "default": "fade" },
         "narration": { "type": "string" },
-        "duration": { "type": "number" },
-        "padding": { "type": "number", "default": 1.0 },
-        "transition": { "type": "string" }
-      },
-      "required": ["type", "text"],
-      "additionalProperties": false
+        "duration": { "type": "number", "exclusiveMinimum": 0 },
+        "padding": { "type": "number", "minimum": 0, "default": 1.0 },
+        "image": { "$ref": "#/definitions/sceneImage" },
+        "transition": { "type": "string", "enum": ["none", "fade", "slide-left", "wipe"] }
+      }
     }
   }
 }

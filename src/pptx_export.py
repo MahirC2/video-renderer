@@ -8,7 +8,9 @@ import json
 from pathlib import Path
 
 from pptx import Presentation
+from pptx.chart.data import CategoryChartData
 from pptx.dml.color import RGBColor
+from pptx.enum.chart import XL_CHART_TYPE, XL_LABEL_POSITION, XL_MARKER_STYLE
 from pptx.enum.text import PP_ALIGN
 from pptx.util import Emu, Inches, Pt
 
@@ -19,6 +21,80 @@ SLIDE_H = Inches(7.5)
 def _rgb(hex_color: str) -> RGBColor:
     h = hex_color.lstrip("#")
     return RGBColor(int(h[0:2], 16), int(h[2:4], 16), int(h[4:6], 16))
+
+
+def _add_native_chart(slide, scene: dict, bg: RGBColor,
+                      fg: RGBColor, accent: RGBColor) -> bool:
+    """Add an editable PowerPoint chart. Return False if it cannot be built."""
+    chart_types = {
+        "bar": XL_CHART_TYPE.COLUMN_CLUSTERED,
+        "line": XL_CHART_TYPE.LINE_MARKERS,
+        "pie": XL_CHART_TYPE.PIE,
+    }
+    try:
+        data = CategoryChartData()
+        data.categories = scene["labels"]
+        data.add_series(scene.get("heading") or "Series 1", scene["values"])
+        graphic = slide.shapes.add_chart(
+            chart_types.get(scene.get("chart_type", "bar")),
+            left=Inches(0.8), top=Inches(0.8),
+            width=SLIDE_W - Inches(1.6), height=SLIDE_H - Inches(1.6),
+            chart_data=data,
+        )
+        chart = graphic.chart
+        chart.has_legend = False
+        if scene.get("heading"):
+            chart.has_title = True
+            chart.chart_title.text_frame.text = scene["heading"]
+            for paragraph in chart.chart_title.text_frame.paragraphs:
+                for run in paragraph.runs:
+                    run.font.color.rgb = fg
+        # A filled chart area keeps the theme background instead of PowerPoint's
+        # default white box. Fall back to the slide fill if a version lacks a
+        # formatting hook; the chart itself remains editable.
+        for area in (chart, chart.plots[0]):
+            try:
+                area.format.fill.solid()
+                area.format.fill.fore_color.rgb = bg
+                area.format.line.fill.background()
+            except (AttributeError, TypeError):
+                pass
+
+        series = chart.series[0]
+        if scene.get("chart_type", "bar") == "pie":
+            palette = [accent, fg, _rgb("#8b949e")]
+            for i, point in enumerate(series.points):
+                point.format.fill.solid()
+                point.format.fill.fore_color.rgb = palette[i % len(palette)]
+            labels = chart.plots[0].data_labels
+            labels.position = XL_LABEL_POSITION.BEST_FIT
+            labels.show_category_name = True
+            labels.show_percentage = True
+            labels.font.color.rgb = fg
+        else:
+            if scene.get("chart_type", "bar") == "line":
+                series.format.line.color.rgb = accent
+                series.marker.style = XL_MARKER_STYLE.CIRCLE
+                series.marker.size = 8
+            else:
+                series.format.fill.solid()
+                series.format.fill.fore_color.rgb = accent
+            chart.category_axis.tick_labels.font.color.rgb = fg
+            chart.value_axis.tick_labels.font.color.rgb = fg
+            if scene.get("y_label"):
+                chart.value_axis.has_title = True
+                chart.value_axis.axis_title.text_frame.text = scene["y_label"]
+                for paragraph in chart.value_axis.axis_title.text_frame.paragraphs:
+                    for run in paragraph.runs:
+                        run.font.color.rgb = fg
+            try:
+                chart.value_axis.major_gridlines.format.line.color.rgb = _rgb("#30363d")
+            except (AttributeError, TypeError):
+                pass
+        return True
+    except (KeyError, ValueError, TypeError, AttributeError) as exc:
+        print(f"[warn] could not make editable PPTX chart ({exc}); using chart image")
+        return False
 
 
 def build_pptx(spec: dict, scene_artifacts: list, output_path: str):
@@ -102,7 +178,7 @@ def build_pptx(spec: dict, scene_artifacts: list, output_path: str):
                     left=SLIDE_W - Inches(5.4), top=Inches(1.2),
                     width=Inches(4.8), height=Inches(4.8))
         elif stype == "chart":
-            if art.get("chart_png"):
+            if not _add_native_chart(slide, scene, bg, fg, accent) and art.get("chart_png"):
                 slide.shapes.add_picture(
                     art["chart_png"],
                     left=Inches(0.8), top=Inches(0.8),
@@ -121,6 +197,18 @@ def build_pptx(spec: dict, scene_artifacts: list, output_path: str):
                 cr.text = scene["caption"]
                 cr.font.size = Pt(16)
                 cr.font.color.rgb = fg
+
+        # Keep the script available to presenters in PowerPoint's notes pane.
+        # The renderer speaks per-bullet narration in preference to the scene
+        # narration, so mirror that precedence here and keep each clip on its
+        # own line. Accessing notes_slide creates it only when there is text.
+        per_bullet = scene.get("narration_per_bullet")
+        if per_bullet:
+            notes_text = "\n".join(per_bullet)
+        else:
+            notes_text = scene.get("narration", "")
+        if notes_text:
+            slide.notes_slide.notes_text_frame.text = notes_text
 
         # embed narration audio on the slide
         if art.get("narration_path"):
